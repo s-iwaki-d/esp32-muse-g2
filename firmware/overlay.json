@@ -1,0 +1,11 @@
+{
+  "files": {
+    "src/bridge_reply.h": "esp32/components/muse/bridge_reply.h",
+    "src/muse_even_bridge.c": "esp32/components/muse/muse_even_bridge.c",
+    "src/bridge_reply.c": "esp32/components/muse/bridge_reply.c",
+    "src/muse_even_bridge.h": "esp32/components/muse/muse_even_bridge.h"
+  },
+  "patches": [
+    "patches/upstream.patch"
+  ]
+}

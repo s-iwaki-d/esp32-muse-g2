@@ -1,0 +1,7 @@
+{
+  "files": {
+    "muse_bridge_ui.c": "esp32/components/muse/muse_bridge_ui.c",
+    "muse_bridge_ui.h": "esp32/components/muse/muse_bridge_ui.h"
+  },
+  "patches": ["ui.patch"]
+}

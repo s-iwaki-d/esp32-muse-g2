@@ -1,0 +1,48 @@
+# Local toolchains, SDK checkouts, build outputs and device credentials.
+/.tools/
+/.cache/
+/.build/
+/.private/
+build/
+backups/
+
+# Dependency and deployment state.
+node_modules/
+.wrangler/
+wrangler.local.toml
+wrangler.*.local.toml
+
+# Keep only explicit examples; real environment files stay local.
+.dev.vars
+.dev.vars.*
+!.dev.vars.example
+.env
+.env.*
+!.env.example
+sdkconfig
+sdkconfig.local
+sdkconfig.old
+sdkconfig.*.old
+
+# Firmware images and logs can contain compiled-in credentials.
+*.bin
+*.elf
+*.uf2
+*.map
+*.log
+*.dmp
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Editor, OS and Python cache files.
+__pycache__/
+*.pyc
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+*.orig
+*.rej

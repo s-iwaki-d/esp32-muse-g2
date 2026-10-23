@@ -1,0 +1,1106 @@
+diff --git a/esp32/components/muse/CMakeLists.txt b/esp32/components/muse/CMakeLists.txt
+index d20c459..b77fbaa 100644
+--- a/esp32/components/muse/CMakeLists.txt
++++ b/esp32/components/muse/CMakeLists.txt
+@@ -49,6 +49,9 @@ if(CONFIG_MUSE_ENABLED)
+         list(APPEND srcs "muse_chat_link.c")   # text replies over Link's session
+     endif()
+     list(APPEND srcs "muse_chat_text.c")
++    if(CONFIG_MUSE_EVEN_BRIDGE)
++        list(APPEND srcs "muse_even_bridge.c" "bridge_reply.c" "muse_bridge_ui.c")
++    endif()
+     if(CONFIG_MUSE_CJK_FONT)
+         list(APPEND srcs "fonts/muse_font_cjk_16.c")   # captions' CJK fallback
+     endif()
+@@ -139,7 +142,7 @@ endif()
+ 
+ set(muse_priv_requires
+     esp_timer esp_driver_usb_serial_jtag esp_psram nvs_flash esp_pm esp_event esp_netif
+-    bt esp-tls mbedtls esp_app_format esp_http_client
++    bt esp-tls mbedtls esp_app_format esp_http_client esp_websocket_client
+     noise_core minimp3 muse_vstream tinyh264 libvpx_vp8
+     esp_lcd esp_adc esp_driver_i2s esp_driver_ledc esp_driver_spi esp_driver_uart esp_wifi
+     esp_driver_pcnt efuse
+diff --git a/esp32/components/muse/Kconfig b/esp32/components/muse/Kconfig
+index cab98f5..0821be2 100644
+--- a/esp32/components/muse/Kconfig
++++ b/esp32/components/muse/Kconfig
+@@ -14,6 +14,25 @@
+ 
+ menu "Muse"
+ 
++    config MUSE_EVEN_BRIDGE
++        bool "Even G2 Cloudflare bridge"
++        default n
++        depends on MUSE_ENABLED && MUSE_HATCH
++        help
++            Forward authenticated Worker requests into one dedicated Muse chat.
++            Configure secrets locally; never commit a generated sdkconfig.
++
++    config MUSE_BRIDGE_URL
++        string "Worker device WebSocket URL (wss://host/device/ws)"
++        default ""
++        depends on MUSE_EVEN_BRIDGE
++
++    config MUSE_BRIDGE_TOKEN
++        string "Worker device bearer token"
++        default ""
++        depends on MUSE_EVEN_BRIDGE
++
++
+     choice MUSE_BOARD
+         prompt "Board with the full UI"
+         default MUSE_BOARD_NONE
+diff --git a/esp32/components/muse/boards/board_m5stack_stopwatch.c b/esp32/components/muse/boards/board_m5stack_stopwatch.c
+index 68f0ef9..d77f3e0 100644
+--- a/esp32/components/muse/boards/board_m5stack_stopwatch.c
++++ b/esp32/components/muse/boards/board_m5stack_stopwatch.c
+@@ -1117,7 +1117,30 @@ static const muse_board_t s_board = {
+ };
+ 
+ /* Home Link's app_main starts Muse with this board (main/main.c). */
++#if CONFIG_MUSE_EVEN_BRIDGE
++static esp_err_t bridge_init(void)
++{
++    ESP_RETURN_ON_ERROR(init(), TAG, "bridge board init");
++    /* G2 supplies text. Keep the codec/microphone rail and I2S pins parked
++     * without allocating the duplex I2S DMA buffers or starting capture. */
++    codec_power(false);
++    return ESP_OK;
++}
++#endif
++
+ const muse_board_t *muse_board_get(void)
+ {
++#if CONFIG_MUSE_EVEN_BRIDGE
++    /* Preserve the display, physical pairing key and power controls while
++     * using muse_app's existing display-only startup path. */
++    static muse_board_t text_board;
++    text_board = s_board;
++    text_board.init = bridge_init;
++    text_board.audio_init = NULL;
++    text_board.audio_power = NULL;
++    text_board.codec_power = NULL;
++    return &text_board;
++#else
+     return &s_board;
++#endif
+ }
+diff --git a/esp32/components/muse/idf_component.yml b/esp32/components/muse/idf_component.yml
+index 2f8924a..db27979 100644
+--- a/esp32/components/muse/idf_component.yml
++++ b/esp32/components/muse/idf_component.yml
+@@ -13,6 +13,7 @@
+ # limitations under the License.
+ 
+ dependencies:
++  espressif/esp_websocket_client: "1.2.3"
+   idf:
+     version: ">=5.5"
+   espressif/cjson: "~1.7"
+diff --git a/esp32/components/muse/muse_chat_session.cpp b/esp32/components/muse/muse_chat_session.cpp
+index 2866f5d..fd07bdc 100644
+--- a/esp32/components/muse/muse_chat_session.cpp
++++ b/esp32/components/muse/muse_chat_session.cpp
+@@ -72,6 +72,7 @@ extern "C" {
+ #include "muse_wifi.h"
+ }
+ #include "muse_chat_priv.h"
++#include "muse_even_bridge.h"
+ 
+ #include <xplat/noise/core/ClientSession.h>
+ #include <xplat/noise/core/PsaCryptoBackend.h>
+@@ -136,12 +137,13 @@ static_assert(MP3_BUF > MP3_POLL_ROOM + MP3_HOLD, "reads would stall with the MP
+ 
+ /* ---- Voice task <-> session task ---- */
+ 
+-enum cmd_type_t : uint8_t { CMD_CONNECT, CMD_FORGET, CMD_BEGIN, CMD_END, CMD_CANCEL, CMD_TEXT, CMD_TEXT_CANCEL, CMD_WAKE };
++enum cmd_type_t : uint8_t { CMD_CONNECT, CMD_FORGET, CMD_BEGIN, CMD_END, CMD_CANCEL, CMD_TEXT, CMD_TEXT_CANCEL, CMD_WAKE, CMD_BRIDGE_TEXT, CMD_BRIDGE_CANCEL };
+ 
+ struct cmd_t {
+     cmd_type_t type;
+     uint32_t gen;
+     char *text;              /* CMD_TEXT: malloc'd, freed by the session task */
++    char session_id[37] = {}; /* dedicated bridge chat, copied with the command */
+ };
+ 
+ struct ev_t {
+@@ -154,6 +156,7 @@ static QueueHandle_t s_cmds, s_events;
+ static StreamBufferHandle_t s_in, s_out;
+ static std::atomic<uint32_t> s_gen{0};
+ static std::atomic<bool> s_resting{false};
++static std::atomic<uint32_t> s_bridge_allowed_gen{0};
+ 
+ /* ---- Connection ---- */
+ 
+@@ -221,6 +224,10 @@ struct turn_t {
+     phase_t phase;
+     uint32_t gen;
+     bool text;               /* typed at the console: the reply goes there, unspoken */
++    uint32_t bridge_gen;
++    char bridge_session[37];
++    bool bridge_create_pending;
++    int64_t bridge_subscribe_deadline;
+     bool end_requested, end_sent, chat_posted, acked;
+     int64_t dict_id, chat_id;
+     int64_t start_us, end_sent_us, chat_us, last_event_us, last_content_us;
+@@ -256,6 +263,30 @@ struct turn_t {
+ /* 10 KB, most of it the MP3 decoder: in PSRAM on boards that let static data go
+  * there (the AIPI), so Wi-Fi setup and TLS have the internal RAM. */
+ EXT_RAM_BSS_ATTR static turn_t s_turn;
++static cJSON *s_bridge_pending;
++static size_t s_bridge_pending_bytes;
++/* Replay IDs are used only by the PSRAM-backed chat task, never by an ISR. */
++EXT_RAM_BSS_ATTR static char s_bridge_retired[64][80];
++static unsigned s_bridge_retired_next;
++
++static bool bridge_retired(const char *id)
++{
++    if (!id || !*id) return false;
++    for (const auto &old : s_bridge_retired) if (!strcmp(id, old)) return true;
++    return false;
++}
++static void bridge_retire(const char *id)
++{
++    if (id && *id) strlcpy(s_bridge_retired[s_bridge_retired_next++ % 64], id, 80);
++}
++static void bridge_retire_event(cJSON *event)
++{
++    cJSON *payload = cJSON_GetObjectItem(event, "payload");
++    const char *keys[] = {"message_id", "id", "task_id"};
++    for (const char *key : keys)
++        bridge_retire(cJSON_GetStringValue(cJSON_GetObjectItem(payload, key)));
++    bridge_retire(cJSON_GetStringValue(cJSON_GetObjectItem(event, "message_id")));
++}
+ 
+ /* Turn milestones, logged together when the turn ends. */
+ enum mark_t : uint8_t { M_RELEASE, M_SENT, M_ACK, M_TEXT, M_DONE, M_TTS, M_MP3, M_AUDIO, M_COUNT };
+@@ -265,10 +296,12 @@ static char s_reply_shown[EV_TEXT];   /* the pre-speech caption last sent */
+ 
+ static void mark(mark_t m);
+ static bool open_note(void);
++static bool poll_socket(void);
+ static void log_marks(void);
+ static int16_t *s_pcm;       /* MINIMP3_MAX_SAMPLES_PER_FRAME */
+ static int16_t *s_pcm16;     /* resampled output */
+ static int64_t s_last_seq;
++static char s_subscription_session[37];
+ 
+ static int64_t now_us(void)
+ {
+@@ -809,8 +842,11 @@ static bool resolve_vm(char *err, size_t err_cap)
+ static bool open_subscription(void)
+ {
+     s_last_seq = 0;
+-    s_conn.sub_id = open_stream(K_SUB, "POST", "/chat/subscribe", "application/json", "application/x-ndjson", "{}",
++    char body[64] = "{}";
++    if (s_turn.bridge_session[0]) snprintf(body, sizeof(body), "{\"session_id\":\"%s\"}", s_turn.bridge_session);
++    s_conn.sub_id = open_stream(K_SUB, "POST", "/chat/subscribe", "application/json", "application/x-ndjson", body,
+                                 true);
++    if (s_conn.sub_id) strlcpy(s_subscription_session, s_turn.bridge_session, sizeof(s_subscription_session));
+     return s_conn.sub_id != 0;
+ }
+ 
+@@ -960,6 +996,29 @@ static void turn_reset_streams(void)
+ 
+ static void turn_finish(void)
+ {
++    if (s_turn.bridge_gen) {
++        // A failed or cancelled setup must not leave an unanswered stream for
++        // the next turn to reuse. Retain only a confirmed, live subscription.
++        stream_t *subscription = find_stream(s_conn.sub_id);
++        if (!subscription || subscription->status < 200 || subscription->status >= 300) {
++            send_reset(s_conn.sub_id);
++            s_conn.sub_id = 0;
++            s_subscription_session[0] = '\0';
++        }
++        for (int i = 0; i < s_turn.nmsgs; i++) bridge_retire(s_turn.msgs[i].id);
++        for (const auto &id : s_turn.user_ids) bridge_retire(id);
++    }
++    cJSON *held;
++    cJSON_ArrayForEach(held, s_bridge_pending) bridge_retire_event(held);
++    cJSON_Delete(s_bridge_pending);
++    s_bridge_pending = nullptr;
++    s_bridge_pending_bytes = 0;
++    uint32_t finished_generation = s_turn.bridge_gen;
++    if (finished_generation) s_bridge_allowed_gen.compare_exchange_strong(finished_generation, 0);
++    s_turn.bridge_gen = 0;
++    s_turn.bridge_session[0] = '\0';
++    s_turn.bridge_create_pending = false;
++    s_turn.bridge_subscribe_deadline = 0;
+     turn_reset_streams();
+     s_turn.phase = P_IDLE;
+     s_turn.dict_id = s_turn.chat_id = 0;
+@@ -971,7 +1030,8 @@ static void turn_finish(void)
+ static void turn_fail(const char *why)
+ {
+     ESP_LOGW(TAG, "turn failed: %s", why);
+-    if (s_turn.text) {
++    if (s_turn.bridge_gen) muse_bridge_emit(s_turn.bridge_gen, BRIDGE_ERROR, 0, why, false);
++    if (s_turn.text && !s_turn.bridge_gen) {
+         muse_hatch_console("error", why, nullptr);
+     }
+     emit(MUSE_HATCH_EV_ERROR, why);
+@@ -981,7 +1041,8 @@ static void turn_fail(const char *why)
+ /* Ends the turn once its reply is in; `complete` is false when it was cut off. */
+ static void turn_done(bool complete)
+ {
+-    if (s_turn.text) {
++    if (s_turn.bridge_gen) muse_bridge_emit(s_turn.bridge_gen, BRIDGE_DONE, 0, nullptr, complete);
++    if (s_turn.text && !s_turn.bridge_gen) {
+         muse_hatch_console("done", nullptr, "\"messages\":%d,\"complete\":%s", s_turn.nmsgs,
+                            complete ? "true" : "false");
+     }
+@@ -990,7 +1051,7 @@ static void turn_done(bool complete)
+ }
+ 
+ /* Ends any turn in progress and starts a fresh one. False if Hatch can't be reached. */
+-static bool turn_start(uint32_t gen, bool text)
++static bool turn_start(uint32_t gen, bool text, uint32_t bridge_gen = 0, const char *session_id = nullptr)
+ {
+     if (s_turn.phase != P_IDLE) {
+         if (s_turn.text) {
+@@ -1008,6 +1069,8 @@ static bool turn_start(uint32_t gen, bool text)
+     s_turn.texts = texts;
+     s_turn.gen = gen;
+     s_turn.text = text;
++    s_turn.bridge_gen = bridge_gen;
++    if (session_id) strlcpy(s_turn.bridge_session, session_id, sizeof(s_turn.bridge_session));
+     s_turn.tts_msg = -1;
+     memset(s_marks, 0, sizeof(s_marks));
+     s_reply_shown[0] = '\0';
+@@ -1017,6 +1080,32 @@ static bool turn_start(uint32_t gen, bool text)
+         turn_fail(muse_hatch_configured() ? "CAN'T REACH MUSE" : "MUSE NOT SET UP");
+         return false;
+     }
++    // Native voice returns to the main chat; bridge text uses its dedicated chat.
++    if (strcmp(s_subscription_session, s_turn.bridge_session) || !find_stream(s_conn.sub_id)) {
++        send_reset(s_conn.sub_id);
++        if (!open_subscription()) {
++            turn_fail("CAN'T SUBSCRIBE TO MUSE");
++            return false;
++        }
++    }
++    if (bridge_gen) {
++        // Do not post a message until the scoped subscription is actually ready.
++        int64_t deadline = now_us() + 15 * 1000000LL;
++        for (;;) {
++            // A side chat does not exist until its first /chat/stream POST.
++            // Only an explicit 404 permits that first message before subscribe.
++            if (s_turn.bridge_create_pending) break;
++            stream_t *subscription = find_stream(s_conn.sub_id);
++            if (subscription && subscription->status >= 200 && subscription->status < 300) break;
++            if (!s_connected || s_turn.bridge_gen != bridge_gen) return false;
++            if (s_bridge_allowed_gen.load() != bridge_gen) { turn_fail("CANCELLED"); return false; }
++            if (now_us() >= deadline || !poll_socket()) {
++                turn_fail("MUSE SUBSCRIPTION NOT READY");
++                return false;
++            }
++            vTaskDelay(pdMS_TO_TICKS(5));
++        }
++    }
+     return true;
+ }
+ 
+@@ -1182,6 +1271,7 @@ static void send_chat(const char *text, const char *modality)
+     cJSON *body = cJSON_CreateObject();
+     cJSON_AddStringToObject(body, "message", text);
+     cJSON_AddStringToObject(body, "output_modality", modality);
++    if (s_turn.bridge_gen) cJSON_AddStringToObject(body, "session_id", s_turn.bridge_session);
+     char *json = cJSON_PrintUnformatted(body);
+     cJSON_Delete(body);
+     size_t len = json ? strlen(json) : 0;
+@@ -1225,16 +1315,17 @@ static void post_chat(const char *text)
+ }
+ 
+ /* A typed turn: the text goes straight to the chat. */
+-static void text_begin(const char *text)
++static void text_begin(const char *text, uint32_t bridge_gen = 0, const char *session_id = nullptr)
+ {
+-    if (!turn_start(0, true)) {
++    if (!turn_start(0, true, bridge_gen, session_id)) {
+         return;
+     }
++    if (bridge_gen && s_bridge_allowed_gen.load() != bridge_gen) { turn_fail("CANCELLED"); return; }
+     ESP_LOGI(TAG, "typed turn: %u bytes", (unsigned)strlen(text));
+     send_chat(text, "text");
+     if (s_turn.phase == P_WAIT_REPLY) {
+         mark(M_SENT);
+-        muse_hatch_console("sent", nullptr, "\"bytes\":%u", (unsigned)strlen(text));
++        if (!s_turn.bridge_gen) muse_hatch_console("sent", nullptr, "\"bytes\":%u", (unsigned)strlen(text));
+     }
+ }
+ 
+@@ -1303,6 +1394,7 @@ static bool is_user_id(const char *id)
+ /* The message `id` if it belongs to this turn, binding it on first sight; else -1. */
+ static int bind_msg(const char *id, cJSON *payload)
+ {
++    if (s_turn.bridge_gen && (strlen(id) >= sizeof(s_turn.msgs[0].id) || bridge_retired(id))) return -1;
+     if (muse_chat_is_rejected(&s_turn.rejected, id)) {
+         return -1;
+     }
+@@ -1314,8 +1406,12 @@ static int bind_msg(const char *id, cJSON *payload)
+     if (!parent) {
+         parent = cJSON_GetStringValue(cJSON_GetObjectItem(payload, "parent_message_id"));
+     }
++    if (s_turn.bridge_gen && bridge_retired(parent)) {
++        muse_chat_reject(&s_turn.rejected, id); return -1;
++    }
+     /* Once the ack names our message, replies to anything else are someone else's. */
+-    if (parent && parent[0] && s_turn.acked && !is_user_id(parent) && find_msg(parent) < 0) {
++    if (parent && parent[0] && s_turn.acked && !is_user_id(parent) && find_msg(parent) < 0 &&
++        !(s_turn.bridge_gen && !strcmp(parent, id))) {
+         muse_chat_reject(&s_turn.rejected, id);
+         return -1;
+     }
+@@ -1323,6 +1419,7 @@ static int bind_msg(const char *id, cJSON *payload)
+         return -1;
+     }
+     if (s_turn.nmsgs == MAX_MSGS) {
++        if (s_turn.bridge_gen) turn_fail("TOO MANY MUSE MESSAGES");
+         return -1;
+     }
+     msg_t &m = s_turn.msgs[s_turn.nmsgs];
+@@ -1383,6 +1480,12 @@ static void message_done(int i, const char *final_text)
+     }
+     m.done = true;
+     mark(M_DONE);
++    if (s_turn.bridge_gen) {
++        // A final may correct text without changing its length.
++        if (final_text) muse_bridge_emit(s_turn.bridge_gen, BRIDGE_FINAL, i, final_text, false);
++        muse_bridge_emit(s_turn.bridge_gen, BRIDGE_MESSAGE_DONE, i, nullptr, false);
++        return;
++    }
+     if (s_turn.text) {
+         /* The whole text if the pieces didn't add up to it (a line skipped, say): the reader uses it instead. */
+         size_t n = m.len;
+@@ -1420,6 +1523,39 @@ static void on_event(cJSON *line)
+     if (strcmp(cJSON_GetStringValue(cJSON_GetObjectItem(line, "type")) ?: "", "event") != 0) {
+         return;   /* the subscription ack */
+     }
++    cJSON *bridge_payload = cJSON_GetObjectItem(line, "payload");
++    if (s_turn.phase == P_IDLE && s_subscription_session[0]) {
++        const char *session = cJSON_GetStringValue(cJSON_GetObjectItem(bridge_payload, "session_id"));
++        if (!session) session = cJSON_GetStringValue(cJSON_GetObjectItem(line, "session_id"));
++        if (session && !strcmp(session, s_subscription_session)) bridge_retire_event(line);
++        return;
++    }
++    if (s_turn.bridge_gen) {
++        const char *session = cJSON_GetStringValue(cJSON_GetObjectItem(bridge_payload, "session_id"));
++        if (!session) session = cJSON_GetStringValue(cJSON_GetObjectItem(line, "session_id"));
++        if (!session || strcmp(session, s_turn.bridge_session)) return;
++        if (!s_turn.chat_posted) {
++            // Replay/history seen before this request cannot be its response.
++            bridge_retire_event(line);
++            return;
++        }
++        if (!s_turn.acked) {
++            char *encoded = cJSON_PrintUnformatted(line);
++            size_t bytes = encoded ? strlen(encoded) : 65537;
++            cJSON_free(encoded);
++            if (!s_bridge_pending) s_bridge_pending = cJSON_CreateArray();
++            if (!s_bridge_pending || cJSON_GetArraySize(s_bridge_pending) >= 64 ||
++                bytes > 65536 - s_bridge_pending_bytes) {
++                turn_fail("MUSE EVENT BUFFER FULL"); return;
++            }
++            cJSON *copy = cJSON_Duplicate(line, true);
++            if (!copy || !cJSON_AddItemToArray(s_bridge_pending, copy)) {
++                cJSON_Delete(copy); turn_fail("MUSE EVENT ALLOCATION FAILED"); return;
++            }
++            s_bridge_pending_bytes += bytes;
++            return;
++        }
++    }
+     cJSON *seq = cJSON_GetObjectItem(line, "seq");
+     if (cJSON_IsNumber(seq)) {
+         int64_t v = (int64_t)seq->valuedouble;
+@@ -1443,7 +1579,7 @@ static void on_event(cJSON *line)
+         } else if (status) {
+             s_turn.agent_busy = status[0] && strcmp(status, "completed") && strcmp(status, "failed");
+         }
+-        if (s_turn.text && s_turn.agent_busy != was) {
++        if (s_turn.text && !s_turn.bridge_gen && s_turn.agent_busy != was) {
+             muse_hatch_console("busy", nullptr, "\"on\":%s", s_turn.agent_busy ? "true" : "false");
+         }
+         s_turn.last_event_us = now_us();
+@@ -1468,7 +1604,8 @@ static void on_event(cJSON *line)
+         if (text && text[0] && s_turn.text) {
+             mark(M_TEXT);
+             m.len += strlen(text);
+-            muse_hatch_console("text", text, "\"msg\":%d", i);
++            if (s_turn.bridge_gen) muse_bridge_emit(s_turn.bridge_gen, BRIDGE_TEXT, i, text, false);
++            else muse_hatch_console("text", text, "\"msg\":%d", i);
+         } else if (text && text[0]) {
+             mark(M_TEXT);
+             append_text(m, text);
+@@ -1492,6 +1629,15 @@ static void on_chat_ack(stream_t *s)
+     cJSON *root = cJSON_Parse(s->line);
+     cJSON *result = cJSON_GetObjectItem(root, "result");
+     cJSON *obj = cJSON_IsObject(result) ? result : root;
++    if (s_turn.bridge_gen) {
++        const char *session = cJSON_GetStringValue(cJSON_GetObjectItem(obj, "session_id"));
++        const char *id = cJSON_GetStringValue(cJSON_GetObjectItem(obj, "message_id"));
++        if (!session || strcmp(session, s_turn.bridge_session) ||
++            !cJSON_IsTrue(cJSON_GetObjectItem(obj, "is_thread")) || !id || !*id || strlen(id) >= 80) {
++            cJSON_Delete(root);
++            turn_fail("MUSE DID NOT ACKNOWLEDGE THE BRIDGE CHAT"); return;
++        }
++    }
+     const char *keys[] = { "message_id", "reply_to_message_id" };
+     for (int k = 0; k < 2; k++) {
+         const char *id = cJSON_GetStringValue(cJSON_GetObjectItem(obj, keys[k]));
+@@ -1500,6 +1646,26 @@ static void on_chat_ack(stream_t *s)
+         }
+     }
+     s_turn.acked = true;
++    if (s_turn.bridge_create_pending) {
++        // The validated ACK establishes this UUID as our side chat. Subscribe
++        // immediately; there is no documented history replay and never a retry
++        // of the user message if the first response was already missed.
++        s_turn.bridge_create_pending = false;
++        if (!open_subscription()) {
++            cJSON_Delete(root);
++            turn_fail("CAN'T SUBSCRIBE TO NEW BRIDGE CHAT"); return;
++        }
++        s_turn.bridge_subscribe_deadline = now_us() + 15 * 1000000LL;
++    }
++    cJSON *pending = s_bridge_pending;
++    s_bridge_pending = nullptr;
++    s_bridge_pending_bytes = 0;
++    cJSON *event;
++    cJSON_ArrayForEach(event, pending) {
++        if (s_turn.phase != P_WAIT_REPLY) break;
++        on_event(event);
++    }
++    cJSON_Delete(pending);
+     mark(M_ACK);
+     ESP_LOGI(TAG, "chat/stream ack: user message %s", s_turn.user_ids[0]);
+     cJSON_Delete(root);
+@@ -1665,6 +1831,15 @@ static void check_turn(void)
+     if (s_turn.phase != P_WAIT_REPLY) {
+         return;
+     }
++    if (s_turn.bridge_subscribe_deadline) {
++        stream_t *subscription = find_stream(s_conn.sub_id);
++        if (subscription && subscription->status >= 200 && subscription->status < 300) {
++            s_turn.bridge_subscribe_deadline = 0;
++        } else {
++            if (t >= s_turn.bridge_subscribe_deadline) turn_fail("MUSE SUBSCRIPTION NOT READY");
++            return;
++        }
++    }
+     bool text = s_turn.text;
+     if (t - s_turn.start_us > (text ? TEXT_TURN_CAP_US : TURN_CAP_US)) {
+         ESP_LOGW(TAG, "turn hit the time cap");
+@@ -1800,6 +1975,17 @@ static bool stream_end(stream_t *s, bool ok)
+ 
+ static bool on_http_error(stream_t *s, const ApplicationResponseView &resp)
+ {
++    if (s->kind == K_SUB && s->id == s_conn.sub_id && resp.status == 404 &&
++        s_turn.bridge_gen && !s_turn.chat_posted) {
++        // /chat/subscribe cannot create a new side chat. Permit one real
++        // message to create it; all other errors still fail the subscription.
++        close_stream(s);
++        s_conn.sub_id = 0;
++        s_subscription_session[0] = '\0';
++        s_turn.bridge_create_pending = true;
++        ESP_LOGI(TAG, "bridge side chat needs its first message before subscription");
++        return true;
++    }
+     char body[160];
+     size_t n = resp.body.size() < sizeof(body) - 1 ? resp.body.size() : sizeof(body) - 1;
+     memcpy(body, resp.body.data(), n);
+@@ -1927,6 +2113,20 @@ static void handle(const cmd_t &cmd)
+             turn_finish();
+         }
+         break;
++    case CMD_BRIDGE_TEXT:
++        if (s_bridge_allowed_gen.load() != cmd.gen) {
++            free(cmd.text); break; // canceled before the session task reached it
++        }
++        if (s_turn.phase != P_IDLE) {
++            muse_bridge_emit(cmd.gen, BRIDGE_ERROR, 0, "MUSE IS BUSY", false);
++        } else {
++            text_begin(cmd.text, cmd.gen, cmd.session_id);
++        }
++        free(cmd.text);
++        break;
++    case CMD_BRIDGE_CANCEL:
++        if (s_turn.bridge_gen == cmd.gen) turn_fail("CANCELLED");
++        break;
+     case CMD_TEXT:
+         if (s_turn.phase != P_IDLE && !s_turn.text) {
+             muse_hatch_console("error", "BUSY WITH A VOICE TURN", nullptr);
+@@ -2146,6 +2346,26 @@ extern "C" void muse_hatch_text_turn(char *text)
+     }
+ }
+ 
++extern "C" bool muse_bridge_session_submit(uint32_t generation, const char *text, const char *session_id)
++{
++    if (!generation || !s_cmds || !muse_hatch_configured() || !text || !session_id || strlen(session_id) != 36) return false;
++    cmd_t cmd{CMD_BRIDGE_TEXT, generation, strdup(text)};
++    if (!cmd.text) return false;
++    strlcpy(cmd.session_id, session_id, sizeof(cmd.session_id));
++    s_bridge_allowed_gen.store(generation);
++    if (xQueueSend(s_cmds, &cmd, pdMS_TO_TICKS(100)) == pdTRUE) return true;
++    s_bridge_allowed_gen.compare_exchange_strong(generation, 0);
++    free(cmd.text);
++    return false;
++}
++
++extern "C" void muse_bridge_session_cancel(uint32_t generation)
++{
++    uint32_t expected = generation;
++    s_bridge_allowed_gen.compare_exchange_strong(expected, 0);
++    post(CMD_BRIDGE_CANCEL, generation);
++}
++
+ extern "C" void muse_hatch_text_cancel(void)
+ {
+     post(CMD_TEXT_CANCEL, 0);
+diff --git a/esp32/components/muse/muse_input.c b/esp32/components/muse/muse_input.c
+index 32cd9ba..2b10bdf 100644
+--- a/esp32/components/muse/muse_input.c
++++ b/esp32/components/muse/muse_input.c
+@@ -94,6 +94,10 @@ static volatile bool s_nap_now;   /* ">nap": asleep, as if on battery, nap witho
+ 
+ static void post(muse_ptt_t type, bool wake)
+ {
++#if CONFIG_MUSE_EVEN_BRIDGE
++    /* Pairing, menu selection and waking are handled before PTT is posted. */
++    if (!muse_board->audio_init && !muse_board->mic_init) return;
++#endif
+     muse_input_event_t ev = { .type = type, .wake = wake };
+     ESP_LOGI(TAG, "PTT %s%s", type == MUSE_PTT_DOWN ? "down" : "up", wake ? " (waking)" : "");
+     xQueueSend(s_queue, &ev, 0);
+@@ -422,8 +426,13 @@ bool muse_input_cpu_pd(void)
+ static bool update_power(void)
+ {
+     static bool paused;
++    bool voice_resting = muse_voice_resting();
++#if CONFIG_MUSE_EVEN_BRIDGE
++    /* A display-only bridge has no voice task to publish its resting state. */
++    voice_resting |= !muse_board->audio_init && !muse_board->mic_init;
++#endif
+     bool pause = muse_board->display_pause && muse_state_on_battery() && muse_state_asleep()
+-                 && muse_ui_dark() && muse_voice_resting();
++                 && muse_ui_dark() && voice_resting;
+     bool want_low = pause && !muse_console_host();
+     if (pause == paused && want_low == s_cpu_low) {
+         return paused;
+@@ -465,6 +474,10 @@ static bool update_wifi_nap(TickType_t now, bool paused)
+     }
+     bool nap = paused && !muse_voice_notes_waiting()
+                && (s_nap_now || (s_cpu_low && now - low_since >= pdMS_TO_TICKS(WIFI_NAP_MS)));
++#if CONFIG_MUSE_EVEN_BRIDGE
++    // The bridge must remain reachable while the display sleeps on battery.
++    nap = false;
++#endif
+     if (nap != napping) {
+         napping = nap;
+         ESP_LOGI(TAG, "Wi-Fi %s", nap ? "napping" : "waking");
+@@ -510,6 +523,9 @@ static void dedicated_buttons(unsigned ev)
+         if (muse_state_asleep()) {
+             set_asleep(false, muse_board->speaker_button);   /* wake-only press */
+         } else if (muse_state_mode(NULL) != MUSE_MODE_OFF) {
++#if CONFIG_MUSE_EVEN_BRIDGE
++            if (!muse_board->audio_init) return;   /* no speaker to toggle */
++#endif
+             bool on = !muse_settings_speaker_on();
+             muse_settings_set_speaker_on(on);
+             if (muse_state_mode(NULL) == MUSE_MODE_IDLE) {
+diff --git a/esp32/components/muse/muse_settings_ui.c b/esp32/components/muse/muse_settings_ui.c
+index ff615d4..91519c3 100644
+--- a/esp32/components/muse/muse_settings_ui.c
++++ b/esp32/components/muse/muse_settings_ui.c
+@@ -1079,6 +1079,14 @@ static void on_bright(lv_event_t *e)
+ static void build_sound_page(lv_obj_t *tile)
+ {
+     lv_obj_t *list;
++#if CONFIG_MUSE_EVEN_BRIDGE
++    if (!muse_board->audio_init && !muse_board->mic_init) {
++        s_sound = page(tile, "DISPLAY", true, &list);
++        s_bright_sl = slider(list, "Brightness", 10, 100, muse_settings_brightness(), &s_bright_val, on_bright);
++        set_val(s_bright_val, "%d%%", muse_settings_brightness());
++        return;
++    }
++#endif
+     s_sound = page(tile, "SOUND", true, &list);
+     if (muse_board->audio_init) {
+         s_spk_sw = switch_row(list, "Speaker", muse_settings_speaker_on(), on_speaker_sw);
+@@ -1116,6 +1124,9 @@ static void build_sound_page(lv_obj_t *tile)
+ 
+ static void tick_sound(void)
+ {
++#if CONFIG_MUSE_EVEN_BRIDGE
++    if (!muse_board->audio_init && !muse_board->mic_init) return;
++#endif
+     bool on = muse_settings_speaker_on();   /* also toggled from the face */
+     if (s_spk_sw && on != lv_obj_has_state(s_spk_sw, LV_STATE_CHECKED)) {
+         lv_obj_set_state(s_spk_sw, LV_STATE_CHECKED, on);
+@@ -1346,7 +1357,12 @@ static void build_home(lv_obj_t *tile)
+     row(list, LV_SYMBOL_WIFI, "Wi-Fi", &s_home_wifi, on_nav, (void *)&WIFI);
+     row(list, LV_SYMBOL_HOME, "Muse", &s_home_hatch, on_nav, (void *)&HATCH);
+     row(list, LV_SYMBOL_BLUETOOTH, "Bluetooth", &s_home_ble, on_nav, (void *)&BLE);
+-    row(list, LV_SYMBOL_VOLUME_MAX, "Sound", &s_home_sound, on_nav, (void *)&SOUND);
++#if CONFIG_MUSE_EVEN_BRIDGE
++    if (!muse_board->audio_init && !muse_board->mic_init)
++        row(list, LV_SYMBOL_IMAGE, "Display", &s_home_sound, on_nav, (void *)&SOUND);
++    else
++#endif
++        row(list, LV_SYMBOL_VOLUME_MAX, "Sound", &s_home_sound, on_nav, (void *)&SOUND);
+     row(list, LV_SYMBOL_EYE_CLOSE, "Sleep", &s_home_sleep, on_nav, (void *)&SLEEP);
+     row(list, LV_SYMBOL_BATTERY_FULL, "Battery", &s_home_battery, on_nav, (void *)&BATTERY);
+ #if CONFIG_MUSE_VIDEO
+@@ -1375,6 +1391,11 @@ static void tick_home(void)
+     muse_ble_status(&b);
+     set_text(s_home_ble, b.state == MUSE_BLE_OFF ? "Off" : (b.state == MUSE_BLE_CONNECTED ? "Connected" : "On"));
+ 
++#if CONFIG_MUSE_EVEN_BRIDGE
++    if (!muse_board->audio_init && !muse_board->mic_init) {
++        set_val(s_home_sound, "%d%%", muse_settings_brightness());
++    } else
++#endif
+     if (!muse_board->audio_init) {
+         set_text(s_home_sound, muse_board->mic_init ? "Mic only" : "No audio");
+     } else if (muse_settings_speaker_on()) {
+diff --git a/esp32/components/muse/muse_ui.c b/esp32/components/muse/muse_ui.c
+index b7a3ab0..96a0b40 100644
+--- a/esp32/components/muse/muse_ui.c
++++ b/esp32/components/muse/muse_ui.c
+@@ -1124,6 +1124,12 @@ static void update_control_hints(muse_mode_t mode)
+     lv_obj_set_flag(s_ptt_hint, LV_OBJ_FLAG_HIDDEN, settings);
+     lv_obj_set_flag(s_spk_hint, LV_OBJ_FLAG_HIDDEN, settings);
+     lv_obj_set_flag(s_pwr_hint, LV_OBJ_FLAG_HIDDEN, settings);
++#if CONFIG_MUSE_EVEN_BRIDGE
++    if (!muse_board->audio_init && !muse_board->mic_init) {
++        lv_obj_add_flag(s_ptt_hint, LV_OBJ_FLAG_HIDDEN);
++        lv_obj_add_flag(s_spk_hint, LV_OBJ_FLAG_HIDDEN);
++    }
++#endif
+     static int last_mode = -1;
+     if ((int)mode != last_mode) {
+         color_mic(s_ptt_hint, mode == MUSE_MODE_LISTENING ? 0x64d4ff : 0x80bfff);
+@@ -1371,7 +1377,12 @@ static void update_chrome(float now)
+     if (b.passkey || confirm) {
+         char code[24], hint[40];
+         if (confirm) {
+-            if (muse_board->touch_talk || !muse_board->audio_init) {
++            bool tap = muse_board->touch_talk || !muse_board->audio_init;
++#if CONFIG_MUSE_EVEN_BRIDGE
++            /* Removing audio does not remove the physical pairing key. */
++            tap = muse_board->touch_talk || !muse_board->talk_button;
++#endif
++            if (tap) {
+                 strlcpy(code, "Tap screen", sizeof(code));
+                 strlcpy(hint, "Tap to confirm pairing", sizeof(hint));
+             } else {
+diff --git a/esp32/main/app.c b/esp32/main/app.c
+index 1d1ba5c..6a20e67 100644
+--- a/esp32/main/app.c
++++ b/esp32/main/app.c
+@@ -2402,6 +2402,9 @@ bool app_hatch_vm_credentials(const char *want_vm, char *vm_id, size_t id_cap,
+         .waiter = xTaskGetCurrentTaskHandle(),
+     };
+     if (xTaskCreate(hatch_vm_task, "muse_vm", 8192, &req, 4, NULL) != pdPASS) {
++        ESP_LOGE(TAG, "Muse VM lookup task allocation failed (8192-byte internal stack): free=%u largest=%u",
++                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
++                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+         return false;
+     }
+     ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+diff --git a/esp32/main/ble_server.c b/esp32/main/ble_server.c
+index 8a259d4..db453d5 100644
+--- a/esp32/main/ble_server.c
++++ b/esp32/main/ble_server.c
+@@ -470,6 +470,9 @@ static void dispatch_command_ex(const uint8_t *data, size_t len, bool decrypted)
+             a->session_generation = link_pairing_mark_provisioning_active();
+             if (a->session_generation == 0
+                 || xTaskCreate(provision_task, "prov", 8192, a, 5, NULL) != pdPASS) {
++                ESP_LOGE(TAG, "%s", a->session_generation
++                    ? "Provisioning task allocation failed (8192-byte internal stack)"
++                    : "Pairing session expired before provisioning");
+                 uint32_t generation = a->session_generation;
+                 secure_free_str(a->ssid);
+                 secure_free_str(a->password);
+diff --git a/esp32/main/muse_glue.c b/esp32/main/muse_glue.c
+index d17c670..1a38d79 100644
+--- a/esp32/main/muse_glue.c
++++ b/esp32/main/muse_glue.c
+@@ -40,6 +40,7 @@
+ 
+ #include "muse_ble.h"
+ #include "muse_board.h"
++#include "muse_even_bridge.h"
+ #include "muse_input.h"
+ #include "muse_link.h"
+ #include "muse_mem.h"
+@@ -635,6 +636,15 @@ static void boot_task(void *arg) {
+     xEventGroupWaitBits(s_ready, BIT_STORAGE, pdFALSE, pdTRUE, portMAX_DELAY);
+     load_creds();
+     muse_app_run(muse_board_get());
++#if CONFIG_MUSE_EVEN_BRIDGE
++    /* Pairing needs its internal RAM for BLE and the provisioning task.
++     * Successful setup restarts the device, so start the bridge next boot. */
++    if (config_setup_complete()) {
++        muse_even_bridge_start();
++    } else {
++        ESP_LOGI(TAG, "Even bridge deferred until pairing completes and restarts");
++    }
++#endif
+     xEventGroupSetBits(s_ready, BIT_MUSE);
+     stack_monitor_record(NULL);
+     vTaskDelete(NULL);
+diff --git a/esp32/tests/test_muse_chat_session.py b/esp32/tests/test_muse_chat_session.py
+index 7847475..6921ae9 100644
+--- a/esp32/tests/test_muse_chat_session.py
++++ b/esp32/tests/test_muse_chat_session.py
+@@ -23,28 +23,46 @@ class ChatSession(unittest.TestCase):
+         source = (ROOT / 'components/muse/muse_chat_session.cpp').read_text()
+         constants = source[source.index('#define MIC_RATE'):source.index('/* ---- Voice task')]
+         types = source[source.index('enum phase_t'):source.index('/* 10 KB')]
+-        handlers = source[source.index('static int find_msg('):source.index('static void on_chat_ack(')]
++        handlers = source[source.index('static int find_msg('):source.index('/* ---- Turn: speech ---- */')]
++        retire = source[source.index('static cJSON *s_bridge_pending;'):source.index('/* Turn milestones')]
++        finish = source[source.index('static void turn_finish('):source.index('/* Ends any turn in progress')]
+         reset = source[source.index('static bool turn_start('):source.index('static void turn_begin(')]
++        check = source[source.index('static void check_turn('):source.index('/* ---- Inbound dispatch ---- */')]
++        http = source[source.index('static bool stream_end('):source.index('static bool on_frame(')]
++        typed = source[source.index('static void text_begin('):source.index('static void on_dictation_line(')]
+         code = r'''
+ #include <cassert>
++#include <atomic>
+ #include <cstdint>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
+ #include <initializer_list>
++#include <string>
+ #include "host_compat.h"
+ #include "cJSON.h"
+ #include "minimp3.h"
+ #include "muse_chat_priv.h"
+ #define ESP_LOGI(...) ((void)0)
++#define ESP_LOGW(...) ((void)0)
++#define EXT_RAM_BSS_ATTR
++#include "bridge_reply.h"
+ ''' + constants + types + r'''
+ static turn_t s_turn;
++static std::atomic<uint32_t> s_bridge_allowed_gen{0};
++''' + retire + r'''
++static bridge_reply_t test_reply;
++void muse_bridge_emit(uint32_t gen, bridge_event_t kind, unsigned message, const char *text, bool complete) {
++    bridge_reply_event(&test_reply, gen, kind, message, text, complete);
++}
+ static char s_reply_shown[EV_TEXT];
+ static int64_t s_last_seq, s_marks[4];
+ static int captions, console_events;
+-enum mark_t { M_TEXT, M_DONE };
++enum mark_t { M_TEXT, M_DONE, M_ACK, M_SENT };
+ static void mark(mark_t) {}
+-static int64_t now_us() { return 12345; }
++static int64_t test_now = 12345;
++static int64_t now_us() { return test_now; }
++static void log_marks() {}
+ static void emit(muse_hatch_ev_t type, const char *) {
+     if (type == MUSE_HATCH_EV_REPLY) captions++;
+ }
+@@ -53,12 +71,56 @@ void muse_hatch_tail_words(const char *text, char *out, size_t cap) { strlcpy(ou
+ bool muse_hatch_caption_at(const char *text, size_t, char *out, size_t cap) {
+     strlcpy(out, text, cap); return text[0];
+ }
+-static void turn_finish() { s_turn.phase = P_IDLE; }
+-static void turn_fail(const char *) { turn_finish(); }
++static bool s_connected = true;
++static char s_subscription_session[37];
++enum kind_t { K_NONE, K_SUB, K_DICT, K_CHAT, K_TTS };
++struct stream_t { char *line; size_t len; int status; kind_t kind = K_NONE; int64_t id = 0; };
++struct ApplicationResponseView { int status; std::string body; };
++static stream_t test_sub{nullptr, 0, 200, K_SUB, 1};
++static struct { int64_t sub_id; } s_conn{1};
++static int test_subscriptions, test_posts, test_response_status = 200;
++static bool test_cancel_on_poll;
++static stream_t *find_stream(int64_t id) {
++    return test_sub.kind != K_NONE && id == test_sub.id ? &test_sub : nullptr;
++}
++static void close_stream(stream_t *s) { s->kind = K_NONE; }
++static void send_reset(int64_t id) { if (auto *s = find_stream(id)) close_stream(s); }
++static bool open_subscription() {
++    ++test_subscriptions;
++    test_sub = stream_t{nullptr, 0, 0, K_SUB, 1};
++    s_conn.sub_id = 1;
++    strlcpy(s_subscription_session, s_turn.bridge_session, sizeof(s_subscription_session));
++    return true;
++}
++static bool poll_socket();
++static void turn_reset_streams() {}
++static void on_dictation_end(bool) {}
++static void tts_end(stream_t *s, bool) { close_stream(s); }
++#define pdMS_TO_TICKS(x) (x)
++static void vTaskDelay(int ms) { test_now += ms * 1000LL; }
++''' + finish + r'''
+ static bool ensure_connected() { return true; }
+ bool muse_hatch_configured() { return true; }
+ static void resampler_init(resampler_t *, int, int) {}
+-''' + reset + handlers + r'''
++''' + reset + handlers + check + http + r'''
++static bool poll_socket() {
++    if (test_sub.kind == K_SUB && test_sub.status == 0 && test_response_status) {
++        test_sub.status = test_response_status;
++        bool ok = test_response_status < 400 ||
++            on_http_error(&test_sub, ApplicationResponseView{test_response_status, ""});
++        if (test_cancel_on_poll) s_bridge_allowed_gen.store(0);
++        return ok;
++    }
++    return true;
++}
++static void send_chat(const char *text, const char *modality) {
++    assert(text && *text && !strcmp(modality, "text"));
++    ++test_posts;
++    s_turn.chat_posted = true;
++    s_turn.chat_us = s_turn.last_event_us = now_us();
++    s_turn.phase = P_WAIT_REPLY;
++}
++''' + typed + r'''
+ static void begin(bool typed = false) {
+     assert(turn_start(s_turn.gen + 1, typed));
+     s_turn.phase = P_WAIT_REPLY;
+@@ -67,12 +129,13 @@ static void begin(bool typed = false) {
+     strlcpy(s_turn.user_ids[1], "parent", sizeof(s_turn.user_ids[1]));
+     captions = console_events = 0;
+ }
+-static void event(const char *kind, const char *id, const char *parent = "", const char *text = "") {
++static void event(const char *kind, const char *id, const char *parent = "", const char *text = "", const char *session = "") {
+     cJSON *root = cJSON_CreateObject(), *payload = cJSON_CreateObject();
+     cJSON_AddStringToObject(root, "type", "event");
+     cJSON_AddStringToObject(root, "event", kind);
+     cJSON_AddItemToObject(root, "payload", payload);
+     cJSON_AddStringToObject(payload, "message_id", id);
++    if (*session) cJSON_AddStringToObject(payload, "session_id", session);
+     if (parent[0]) cJSON_AddStringToObject(payload, "reply_to_message_id", parent);
+     cJSON_AddStringToObject(payload, "text", text);
+     cJSON_AddStringToObject(payload, "display_text", text);
+@@ -128,12 +191,168 @@ static void bounded_rejections() {
+     event("message.assistant", "second", "note", "Second");
+     assert(s_turn.nmsgs == 2 && s_turn.msgs[0].done && s_turn.msgs[1].done);
+ }
++
++static const char *SESSION = "11111111-2222-4333-8444-555555555555";
++static void begin_bridge() {
++    bridge_reply_begin(&test_reply, 7);
++    s_bridge_allowed_gen.store(7);
++    assert(turn_start(0, true, 7, SESSION));
++    s_turn.phase = P_WAIT_REPLY;
++    s_turn.chat_posted = true;
++}
++static void acknowledge(const char *session = "11111111-2222-4333-8444-555555555555", bool thread = true) {
++    char buffer[256];
++    snprintf(buffer, sizeof(buffer), "{\"message_id\":\"our-user\",\"session_id\":\"%s\",\"is_thread\":%s}", session, thread ? "true" : "false");
++    stream_t ack{buffer, strlen(buffer), 200};
++    on_chat_ack(&ack);
++}
++static void bridge_isolation_and_final() {
++    begin_bridge();
++    event("delta.text_append", "other-session", "", "secret", "different");
++    assert(!s_bridge_pending);
++    event("delta.message_start", "unrelated", "other-user", "", SESSION);
++    event("delta.text_append", "unrelated", "", "secret", SESSION);
++    event("delta.message_start", "answer", "our-user", "", SESSION);
++    event("delta.text_append", "answer", "", "old", SESSION);
++    assert(!test_reply.total && !s_turn.acked);
++    acknowledge();
++    assert(s_turn.acked && test_reply.total == 3);
++    event("delta.message_done", "answer", "", "new", SESSION);
++    turn_done(true);
++    char *reply = bridge_reply_join(&test_reply);
++    assert(reply && !strcmp(reply, "new")); free(reply);
++}
++static void bridge_ack_rejected() {
++    begin_bridge();
++    event("delta.text_append", "answer", "", "secret", SESSION);
++    acknowledge(SESSION, false);
++    assert(test_reply.terminal && !test_reply.success && !test_reply.total);
++}
++static void bridge_cancel_replay() {
++    begin_bridge();
++    event("delta.text_append", "old-answer", "", "secret", SESSION);
++    turn_fail("CANCELLED");
++    assert(bridge_retired("old-answer"));
++    // Also retire replies received while idle after a cancellation.
++    event("message.assistant", "idle-answer", "", "secret", SESSION);
++    assert(bridge_retired("idle-answer"));
++    begin_bridge(); acknowledge();
++    event("message.assistant", "old-answer", "old-answer", "secret", SESSION);
++    event("message.assistant", "idle-answer", "", "secret", SESSION);
++    assert(!test_reply.total);
++    event("message.assistant", "fresh-answer", "our-user", "correct", SESSION);
++    turn_done(true);
++    char *reply = bridge_reply_join(&test_reply);
++    assert(reply && !strcmp(reply, "correct")); free(reply);
++}
++static void post_to_missing_chat() {
++    test_response_status = 404;
++    bridge_reply_begin(&test_reply, 7);
++    s_bridge_allowed_gen.store(7);
++    text_begin("first user message", 7, SESSION);
++    assert(test_posts == 1 && test_subscriptions == 1);
++    assert(s_turn.bridge_create_pending && !s_turn.acked && !find_stream(s_conn.sub_id));
++}
++static void bridge_creates_once_then_reuses_ready_subscription() {
++    post_to_missing_chat();
++    test_response_status = 200;
++    acknowledge();
++    assert(s_turn.acked && !s_turn.bridge_create_pending && test_subscriptions == 2);
++    assert(test_posts == 1 && s_turn.bridge_subscribe_deadline > now_us());
++    assert(poll_socket()); check_turn();
++    assert(!s_turn.bridge_subscribe_deadline);
++    event("message.assistant", "unrelated", "", "private", "wrong-session");
++    assert(!test_reply.total);
++    event("message.assistant", "first-answer", "our-user", "correct", SESSION);
++    test_now += SETTLE_US + 1; check_turn();
++    assert(test_reply.terminal && test_reply.success && test_posts == 1);
++    bridge_reply_begin(&test_reply, 8); s_bridge_allowed_gen.store(8);
++    text_begin("second user message", 8, SESSION);
++    assert(test_posts == 2 && test_subscriptions == 2 && !s_turn.bridge_create_pending);
++}
++static void bridge_creation_ack_must_match_before_subscribing() {
++    post_to_missing_chat();
++    acknowledge("different-session");
++    assert(test_reply.terminal && !test_reply.success && !test_reply.total);
++    assert(test_posts == 1 && test_subscriptions == 1);
++    assert(!s_turn.bridge_create_pending && !s_turn.bridge_subscribe_deadline);
++}
++static void bridge_non404_does_not_post() {
++    test_response_status = 403;
++    bridge_reply_begin(&test_reply, 7); s_bridge_allowed_gen.store(7);
++    text_begin("must not be sent", 7, SESSION);
++    assert(test_reply.terminal && !test_reply.success && test_posts == 0);
++}
++static void native_and_after_post_404_are_not_creation() {
++    assert(!on_http_error(&test_sub, ApplicationResponseView{404, ""}));
++    assert(!s_turn.bridge_create_pending);
++    begin_bridge();
++    assert(!on_http_error(&test_sub, ApplicationResponseView{404, ""}));
++    assert(!s_turn.bridge_create_pending);
++}
++static void bridge_creation_subscribe_timeout_never_reposts() {
++    post_to_missing_chat();
++    test_response_status = 0;
++    acknowledge();
++    test_now += 15 * 1000000LL + 1; check_turn();
++    assert(test_reply.terminal && !test_reply.success && test_posts == 1);
++    assert(!s_turn.bridge_create_pending && !s_turn.bridge_subscribe_deadline);
++    assert(!find_stream(s_conn.sub_id) && !s_subscription_session[0]);
++    test_response_status = 200;
++    bridge_reply_begin(&test_reply, 8); s_bridge_allowed_gen.store(8);
++    text_begin("next explicit user message", 8, SESSION);
++    assert(test_posts == 2 && test_subscriptions == 3);
++}
++static void bridge_first_reply_missing_is_timeout_without_repost() {
++    post_to_missing_chat();
++    test_response_status = 200;
++    acknowledge(); assert(poll_socket()); check_turn();
++    test_now += TEXT_REPLY_TIMEOUT_US + 1; check_turn();
++    assert(test_reply.terminal && !test_reply.success && !test_reply.total);
++    assert(test_posts == 1 && test_subscriptions == 2);
++}
++static void bridge_cancelled_setup_cleans_subscription() {
++    post_to_missing_chat(); acknowledge();
++    turn_fail("CANCELLED");
++    assert(!find_stream(s_conn.sub_id) && !s_subscription_session[0]);
++    assert(test_posts == 1 && test_subscriptions == 2);
++}
++static void bridge_cancelled_before_post(int status) {
++    test_response_status = status; test_cancel_on_poll = true;
++    bridge_reply_begin(&test_reply, 7); s_bridge_allowed_gen.store(7);
++    text_begin("must not be sent", 7, SESSION);
++    assert(test_reply.terminal && !test_reply.success && test_posts == 0);
++}
++static void bridge_existing_subscription_timeout_cleans_up() {
++    test_response_status = 0;
++    bridge_reply_begin(&test_reply, 7); s_bridge_allowed_gen.store(7);
++    text_begin("must not be sent", 7, SESSION);
++    assert(test_reply.terminal && !test_reply.success && test_posts == 0);
++    assert(!find_stream(s_conn.sub_id) && !s_subscription_session[0]);
++    test_response_status = 200;
++    bridge_reply_begin(&test_reply, 8); s_bridge_allowed_gen.store(8);
++    text_begin("explicit retry", 8, SESSION);
++    assert(test_posts == 1 && test_subscriptions == 2);
++}
+ int main(int argc, char **argv) {
+     assert(argc == 2);
+     switch (atoi(argv[1])) {
+     case 0: rejected_deltas(); break;
+     case 1: valid_parents(); break;
+     case 2: bounded_rejections(); break;
++    case 3: bridge_isolation_and_final(); break;
++    case 4: bridge_ack_rejected(); break;
++    case 5: bridge_cancel_replay(); break;
++    case 6: bridge_creates_once_then_reuses_ready_subscription(); break;
++    case 7: bridge_creation_ack_must_match_before_subscribing(); break;
++    case 8: bridge_non404_does_not_post(); break;
++    case 9: native_and_after_post_404_are_not_creation(); break;
++    case 10: bridge_creation_subscribe_timeout_never_reposts(); break;
++    case 11: bridge_first_reply_missing_is_timeout_without_repost(); break;
++    case 12: bridge_cancelled_setup_cleans_subscription(); break;
++    case 13: bridge_cancelled_before_post(404); break;
++    case 14: bridge_cancelled_before_post(200); break;
++    case 15: bridge_existing_subscription_timeout_cleans_up(); break;
+     default: return 2;
+     }
+ }
+@@ -145,8 +364,10 @@ int main(int argc, char **argv) {
+         commands = [
+             [*shlex.split(os.environ.get('CC', 'cc')), '-std=c11', *flags,
+              '-c', str(JSON / 'cJSON.c'), '-o', str(out / 'cjson.o')],
++            [*shlex.split(os.environ.get('CC', 'cc')), '-std=c11', *flags,
++             '-c', str(ROOT / 'components/muse/bridge_reply.c'), '-o', str(out / 'reply.o')],
+             [*shlex.split(os.environ.get('CXX', 'c++')), '-std=gnu++17', *flags,
+-             str(out / 'session.cpp'), str(out / 'cjson.o'), '-o', str(out / 'session')],
++             str(out / 'session.cpp'), str(out / 'cjson.o'), str(out / 'reply.o'), '-o', str(out / 'session')],
+         ]
+         for command in commands:
+             result = subprocess.run(command, capture_output=True, text=True)
+@@ -166,3 +387,42 @@ int main(int argc, char **argv) {
+ 
+     def test_rejection_capacity_preserves_correlation(self):
+         self.run_case(2)
++
++    def test_bridge_scopes_events_and_waits_for_ack_then_keeps_authoritative_final(self):
++        self.run_case(3)
++
++    def test_bridge_rejects_unacknowledged_side_chat(self):
++        self.run_case(4)
++
++    def test_bridge_cancellation_retires_pre_ack_and_idle_replays(self):
++        self.run_case(5)
++
++    def test_missing_side_chat_posts_once_then_subscribes_and_reuses(self):
++        self.run_case(6)
++
++    def test_missing_side_chat_rejects_wrong_ack_before_subscribing(self):
++        self.run_case(7)
++
++    def test_non404_subscription_errors_never_post_user_text(self):
++        self.run_case(8)
++
++    def test_native_and_after_post_404_cannot_create_chat(self):
++        self.run_case(9)
++
++    def test_new_subscription_times_out_without_reposting(self):
++        self.run_case(10)
++
++    def test_missing_first_reply_times_out_without_reposting(self):
++        self.run_case(11)
++
++    def test_cancelled_new_subscription_is_not_reused(self):
++        self.run_case(12)
++
++    def test_cancelled_404_never_posts(self):
++        self.run_case(13)
++
++    def test_cancelled_ready_subscription_never_posts(self):
++        self.run_case(14)
++
++    def test_existing_subscription_timeout_reopens_on_next_request(self):
++        self.run_case(15)

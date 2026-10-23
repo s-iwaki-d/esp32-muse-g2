@@ -1,0 +1,19 @@
+name = "even-muse-bridge"
+main = "src/entry.js"
+compatibility_date = "2026-10-23"
+
+[vars]
+REQUEST_TIMEOUT_MS = "120000"
+# Copy this file to wrangler.local.toml, then set a unique UUID for your installation.
+MUSE_SESSION_ID = ""
+
+[[durable_objects.bindings]]
+name = "BRIDGE"
+class_name = "MuseBridge"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["MuseBridge"]
+
+# Secrets: EVEN_API_KEY, DEVICE_TOKEN.
+# Set with `npx wrangler secret put NAME --config wrangler.local.toml`, never in this file.

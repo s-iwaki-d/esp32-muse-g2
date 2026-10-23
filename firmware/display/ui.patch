@@ -1,0 +1,32 @@
+--- a/esp32/components/muse/muse_ui.c
++++ b/esp32/components/muse/muse_ui.c
+@@ -15,6 +15,9 @@
+  */
+ 
+ #include "muse_ui.h"
++#if CONFIG_MUSE_EVEN_BRIDGE && CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
++#include "muse_bridge_ui.h"
++#endif
+ 
+ #include <math.h>
+ #include <stdio.h>
+@@ -1016,6 +1019,9 @@
+     }
+ 
+     build_answer(face, ring_in);
++#if CONFIG_MUSE_EVEN_BRIDGE && CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
++    muse_bridge_ui_build(face);
++#endif
+ }
+ 
+ 
+@@ -1562,6 +1568,9 @@
+         }
+     }
+     update_power(now);
++#if CONFIG_MUSE_EVEN_BRIDGE && CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
++    muse_bridge_ui_tick(mode == MUSE_MODE_IDLE && s_answer < 0);
++#endif
+ }
+ 
+ static volatile bool s_snapshot;

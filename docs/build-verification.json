@@ -1,0 +1,18 @@
+{
+  "date": "2026-10-23",
+  "sdk_commit": "e6fe5174092702ffddae6f90759a38d55a4ebae1",
+  "idf": "v6.0.1",
+  "board": "M5Stack StopWatch",
+  "app_bytes": 2166784,
+  "app_sha256": "9ded8b89fd301ae36ffc2e4752b1a3f69b74ee569f3f836d936c30dca6ab2cb1",
+  "configuration": "compile-check.invalid; test-only device key; no Muse SDK token",
+  "flashed": false,
+  "deployed": false,
+  "sdk_tests": {
+    "run": 632,
+    "passed": 630,
+    "skipped": 2
+  },
+  "worker_tests": 14,
+  "runtime_tests": 1
+}

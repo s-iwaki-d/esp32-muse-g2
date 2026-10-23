@@ -1,0 +1,7 @@
+{
+  "repository": "https://github.com/facebookincubator/muse-gadget-sdk.git",
+  "commit": "e6fe5174092702ffddae6f90759a38d55a4ebae1",
+  "esp_idf_version": "v6.0.1",
+  "esp_idf_commit": "8c19b156084a0753687347cca1f5355782893533",
+  "board": "m5stack-stopwatch"
+}
