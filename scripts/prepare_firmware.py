@@ -2,6 +2,7 @@
 """Materialize our overlay on the exact upstream SDK, without editing upstream."""
 import argparse
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -10,9 +11,18 @@ ROOT = Path(__file__).resolve().parents[1]
 PIN = json.loads((ROOT / "upstream.json").read_text())
 
 
-def run(*args, cwd=None, capture=False):
+def run(*args, cwd=None, capture=False, env=None):
     return subprocess.run(args, cwd=cwd, check=True, text=True,
-                          stdout=subprocess.PIPE if capture else None).stdout
+                          stdout=subprocess.PIPE if capture else None, env=env).stdout
+
+
+def apply_patch(patch, target):
+    # The generated SDK has no .git. Do not let Git discover the enclosing
+    # bridge repository: apply from a subdirectory would silently skip paths
+    # outside that prefix instead of patching this standalone SDK tree.
+    env = dict(os.environ, GIT_CEILING_DIRECTORIES=str(target.parent))
+    run("git", "apply", "--check", str(patch), cwd=target, env=env)
+    run("git", "apply", str(patch), cwd=target, env=env)
 
 
 def main():
@@ -64,8 +74,7 @@ def main():
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(src, dst)
         for patch in manifest.get("patches", []):
-            run("git", "apply", "--check", str(manifest_path.parent / patch), cwd=target)
-            run("git", "apply", str(manifest_path.parent / patch), cwd=target)
+            apply_patch(manifest_path.parent / patch, target)
     lock = ROOT / "firmware/dependencies.lock"
     if lock.exists():
         shutil.copy2(lock, target / "esp32/dependencies.lock")

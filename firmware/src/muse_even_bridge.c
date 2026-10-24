@@ -1,6 +1,7 @@
 /* Even G2 <-> Cloudflare <-> paired Muse Gadget. Credentials and the Noise
  * connection remain owned by the upstream SDK. This file never forwards them. */
 #include "muse_even_bridge.h"
+#include "bridge_clock.h"
 #include "muse_bridge_ui.h"
 #include "muse_chat.h"
 #include "muse_wifi.h"
@@ -220,6 +221,7 @@ static void bridge_task(void *unused) {
     bool awaiting_exit = false;
     for (;;) {
         bool wifi_ready = muse_wifi_connected();
+        bool clock_ready = bridge_clock_ready(wifi_ready);
         uint32_t current_epoch = epoch();
         if (seen_epoch != current_epoch) { cancel_active(); seen_epoch = current_epoch; }
         if (__atomic_exchange_n(&s_fault, false, __ATOMIC_ACQ_REL)) {
@@ -228,7 +230,7 @@ static void bridge_task(void *unused) {
             cancel_active();
             stop_pending = ws_started;
         }
-        if (!wifi_ready && ws_started) stop_pending = true;
+        if ((!wifi_ready || !clock_ready) && ws_started) stop_pending = true;
         if (ws_started && __atomic_load_n(&s_ws_closed, __ATOMIC_ACQUIRE)) {
             stop_pending = true;
             awaiting_exit = true;
@@ -260,7 +262,7 @@ static void bridge_task(void *unused) {
                 next_lifecycle_attempt = 0;
             }
         }
-        if (!ws_started && muse_wifi_connected() &&
+        if (!ws_started && clock_ready && muse_wifi_connected() &&
             esp_timer_get_time() >= next_lifecycle_attempt) {
             esp_err_t err = esp_websocket_client_start(s_ws);
             if (err == ESP_OK) {
@@ -275,13 +277,13 @@ static void bridge_task(void *unused) {
         if (xQueueReceive(s_incoming, &item, pdMS_TO_TICKS(100)) == pdTRUE) {
             current_epoch = epoch();
             if (seen_epoch != current_epoch) { cancel_active(); seen_epoch = current_epoch; }
-            if (ws_started && !stop_pending && muse_wifi_connected() && online() && item.epoch == seen_epoch)
+            if (ws_started && !stop_pending && clock_ready && muse_wifi_connected() && online() && item.epoch == seen_epoch)
                 receive(item.json, item.epoch);
             free(item.json);
         }
         current_epoch = epoch();
         if (seen_epoch != current_epoch) { cancel_active(); seen_epoch = current_epoch; }
-        bool usable = ws_started && !stop_pending && muse_wifi_connected() && online();
+        bool usable = ws_started && !stop_pending && clock_ready && muse_wifi_connected() && online();
         if (usable) {
             finish_if_ready(seen_epoch);
             if (esp_timer_get_time() - last_ping > 20 * 1000000LL) {

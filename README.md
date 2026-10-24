@@ -38,6 +38,10 @@ StopWatch自身のマイク入力・スピーカー再生は無効です。G2側
 待受中もG2から到達できるようWi-Fi接続を保持します。画面は通常どおり消灯しますが、
 標準SDKのWi-Fi休止時より待機電力が増えます。電池持ちはまだ実測していません。
 
+起動時はWi-Fi接続後に `time.cloudflare.com` へSNTPで時刻を同期してから、Cloudflareへ接続します。
+要求の有効期限を確認するため、ネットワークでDNSとNTP（UDP 123）が利用できる必要があります。
+時刻同期が完了するまでは接続待ちになり、同期できない場合は1分ごとに再試行します。
+
 ## 1. Cloudflare Workerを作成する
 
 [Cloudflare Workersの作成・設定手順](docs/cloudflare-setup.md) に、初回設定をまとめています。

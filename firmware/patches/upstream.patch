@@ -7,7 +7,7 @@ index d20c459..b77fbaa 100644
      endif()
      list(APPEND srcs "muse_chat_text.c")
 +    if(CONFIG_MUSE_EVEN_BRIDGE)
-+        list(APPEND srcs "muse_even_bridge.c" "bridge_reply.c" "muse_bridge_ui.c")
++        list(APPEND srcs "muse_even_bridge.c" "bridge_clock.c" "bridge_reply.c" "muse_bridge_ui.c")
 +    endif()
      if(CONFIG_MUSE_CJK_FONT)
          list(APPEND srcs "fonts/muse_font_cjk_16.c")   # captions' CJK fallback

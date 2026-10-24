@@ -1,5 +1,7 @@
 {
   "files": {
+    "src/bridge_clock.h": "esp32/components/muse/bridge_clock.h",
+    "src/bridge_clock.c": "esp32/components/muse/bridge_clock.c",
     "src/bridge_reply.h": "esp32/components/muse/bridge_reply.h",
     "src/muse_even_bridge.c": "esp32/components/muse/muse_even_bridge.c",
     "src/bridge_reply.c": "esp32/components/muse/bridge_reply.c",
