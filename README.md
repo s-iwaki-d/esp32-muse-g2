@@ -63,6 +63,8 @@ Muse SDKトークンは [Muse Gadgets](https://gadgets.muse.ai/) の Account →
 
 Evenアプリの **設定 → Even AI → Agent Configuration** に、
 `.private/even-settings.txt` の Endpoint と API Key を設定します。
+アプリの版によっては「エージェントを編集」（名前 / URL / トークン）という画面です。
+URLは `https://` から始まる形のまま入力します。省くと要求がWorkerに届かず、G2に「AI サーバエラー」と表示されます。
 端末用の `DEVICE_TOKEN` やMuseのSDKトークンはEvenに設定しません。
 詳細は [作成手順の手順5〜8](docs/cloudflare-setup.md#5-端末設定と認証キーを生成する)、
 受付と端末の通信仕様は [Cloudflare README](cloudflare/README.md) を参照してください。
@@ -70,6 +72,8 @@ Evenアプリの **設定 → Even AI → Agent Configuration** に、
 ## 3. ファームウェアをビルド
 
 初回はPython 3.10以上とCMakeを用意し、プロジェクトルートから次を実行します。
+プロジェクトはASCII文字だけのパスに置いてください。日本語などを含むパスでは、ESP-IDF v6.0.1のビルドが
+`cannot read spec file '.../picolibc.specs'` で失敗します。
 ESP-IDFと関連ツールは、Git管理対象外の `.tools/` に導入します。
 macOSではApple付属Pythonが古い場合があるため、使用するPythonのPATHを先に設定してください。
 
@@ -90,6 +94,8 @@ scripts/idf.sh build
 実機用バイナリには接続先や秘密値が含まれるため、リリース添付などで配布しないでください。
 組み立て済みの `.build/sdk` は生成物なので、編集は `firmware/` の追加ソース・パッチへ行います。
 `prepare_firmware.py` は生成済みSDKを作り直すため、ビルド中に実行しないでください。
+`firmware/sdkconfig.bridge` の変更を取り込んだあとは、`.build/stopwatch/sdkconfig` を削除してからビルドします
+（生成済みのsdkconfigが既定値より優先されるため。接続先とトークンは `.private/sdkconfig.local` から入り直します）。
 
 ## 4. 書き込みとペアリング
 

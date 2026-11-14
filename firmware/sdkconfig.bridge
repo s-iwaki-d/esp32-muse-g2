@@ -2,5 +2,8 @@ CONFIG_MUSE_EVEN_BRIDGE=y
 CONFIG_HOMEHUB_OTA_ENABLED=n
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL=y
+# workers.dev may serve a chain whose top is GTS Root R4 cross-signed by GlobalSign Root CA (R1).
+# R1 is not in the ESP-IDF v6.0.1 bundle; this lets the bundled GTS Root R4 act as the trust anchor (issue #1).
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_CROSS_SIGNED_VERIFY=y
 # On-demand USB screenshots for checking the physical display layout.
 CONFIG_LV_USE_SNAPSHOT=y
