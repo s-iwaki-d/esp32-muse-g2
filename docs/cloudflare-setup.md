@@ -207,6 +207,8 @@ StopWatchは設定後に再ビルド・書き込みが必要です。別のWorke
 | `503 / not_configured` | エラーメッセージを確認。キー未登録なら手順6、会話UUID不正なら手順3を修正して再デプロイ |
 | キーを設定したEvenから `401 / unauthorized` | Evenのキーが `.private/even-settings.txt` のAPI Keyと同じか確認 |
 | `503 / device_offline` | StopWatchが未接続。電源・Wi-Fi・端末側URLと `DEVICE_TOKEN` を確認 |
+| 画面が `Cloudflare offline / Connecting...` のままで、シリアルログに `No matching trusted root certificate found` | `firmware/sdkconfig.bridge` に `CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_CROSS_SIGNED_VERIFY=y` がある版へ更新し、`.build/stopwatch/sdkconfig` を削除して再ビルド・書き込み |
+| Evenで保存後、G2に「AI サーバエラー」と出てWorkerに要求が届かない | EvenのURL欄が `https://` から始まっているか確認 |
 | `409 / device_busy` | 前の会話処理が完了するまで待つ |
 | `502 / muse_unavailable` | Museのペアリング・SDKトークン・Muse側の接続状態を確認 |
 | `504 / timeout` | Museが返答するまでに上限を超過。Muse側の状態を確認 |
